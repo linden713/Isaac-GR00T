@@ -21,6 +21,8 @@ import re
 from typing import Any
 import warnings
 
+import yaml
+
 from gr00t.data.dataset.lerobot_episode_loader import LeRobotEpisodeLoader
 from gr00t.data.dataset.sharded_single_step_dataset import extract_step_data
 from gr00t.data.embodiment_tags import EmbodimentTag
@@ -44,6 +46,23 @@ NOTE: provide --model_path to load up the model checkpoint in this script,
 """
 
 
+def load_action_plot_labels(action_keys: list[str], yaml_path: str | Path) -> list[str]:
+    """Build flattened subplot titles matching ``action_keys`` concat order in open-loop eval."""
+    with open(yaml_path) as f:
+        cfg = yaml.safe_load(f)
+    joints = cfg.get("joints", {})
+    cmd_labels = cfg.get("action_command_plot_labels", {})
+    labels: list[str] = []
+    for key in action_keys:
+        if key in joints:
+            labels.extend(joints[key])
+        elif key in cmd_labels:
+            labels.extend(cmd_labels[key])
+        else:
+            logging.warning("No plot labels for action key %r in %s", key, yaml_path)
+    return labels
+
+
 def plot_trajectory_results(
     state_joints_across_time: np.ndarray,
     gt_action_across_time: np.ndarray,
@@ -53,6 +72,7 @@ def plot_trajectory_results(
     action_keys: list[str],
     action_horizon: int,
     save_plot_path: str,
+    action_dim_labels: list[str] | None = None,
 ) -> None:
     """
     Plot and save trajectory results comparing ground truth and predicted actions.
@@ -66,9 +86,17 @@ def plot_trajectory_results(
         action_keys: List of action modality keys
         action_horizon: Action horizon used for inference
         save_plot_path: Path to save the plot
+        action_dim_labels: Optional per-dimension titles (e.g. joint names); falls back to ``Action {i}``
     """
     actual_steps = len(gt_action_across_time)
     action_dim = gt_action_across_time.shape[1]
+
+    if action_dim_labels is not None and len(action_dim_labels) != action_dim:
+        logging.warning(
+            "action_dim_labels length %d != action_dim %d; using numeric indices for extra/missing labels",
+            len(action_dim_labels),
+            action_dim,
+        )
 
     indices_to_plot = list(range(action_dim))
 
@@ -114,7 +142,11 @@ def plot_trajectory_results(
             else:
                 ax.plot(j, gt_action_across_time[j, action_idx], "ro")
 
-        ax.set_title(f"Action {action_idx}")
+        if action_dim_labels is not None and action_idx < len(action_dim_labels):
+            title = action_dim_labels[action_idx]
+        else:
+            title = f"Action {action_idx}"
+        ax.set_title(title)
         ax.legend()
 
     plt.tight_layout()
@@ -160,6 +192,7 @@ def evaluate_single_trajectory(
     steps=300,
     action_horizon=16,
     save_plot_path=None,
+    action_label_yaml_path: str | Path | None = None,
 ):
     # Ensure steps doesn't exceed trajectory length
     traj = loader[traj_id]
@@ -230,6 +263,16 @@ def evaluate_single_trajectory(
     logging.info(f"gt_action_joints vs time {gt_action_across_time.shape}")
     logging.info(f"pred_action_joints vs time {pred_action_across_time.shape}")
 
+    action_dim_labels = None
+    if action_label_yaml_path is not None:
+        action_dim_labels = load_action_plot_labels(action_keys, action_label_yaml_path)
+        logging.info(
+            "Loaded %d action plot labels from %s (action_keys=%s)",
+            len(action_dim_labels),
+            action_label_yaml_path,
+            action_keys,
+        )
+
     # Plot trajectory results
     plot_trajectory_results(
         state_joints_across_time=state_joints_across_time,
@@ -240,6 +283,7 @@ def evaluate_single_trajectory(
         action_keys=action_keys,
         action_horizon=action_horizon,
         save_plot_path=save_plot_path or f"/tmp/open_loop_eval/traj_{traj_id}.jpeg",
+        action_dim_labels=action_dim_labels,
     )
 
     return mse, mae
@@ -281,6 +325,9 @@ class ArgsConfig:
 
     modality_keys: list[str] | None = None
     """List of modality keys to plot. If None, plot all keys."""
+
+    action_label_yaml_path: str | None = None
+    """YAML with ``joints`` groups and optional ``action_command_plot_labels`` (e.g. gr00t_omni_31dof_joint_space.yaml)."""
 
 
 def main(args: ArgsConfig):
@@ -351,6 +398,7 @@ def main(args: ArgsConfig):
             steps=args.steps,
             action_horizon=args.action_horizon,
             save_plot_path=args.save_plot_path,
+            action_label_yaml_path=args.action_label_yaml_path,
         )
         logging.info(f"MSE for trajectory {traj_id}: {mse}, MAE: {mae}")
         all_mse.append(mse)

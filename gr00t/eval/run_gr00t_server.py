@@ -20,6 +20,9 @@ import os
 from pathlib import Path
 import sys
 
+import numpy as np
+import torch
+
 from gr00t.data.embodiment_tags import EmbodimentTag
 from gr00t.data.types import ModalityConfig
 from gr00t.policy.gr00t_policy import Gr00tPolicy
@@ -68,6 +71,57 @@ class ServerConfig:
     use_sim_policy_wrapper: bool = False
     """Whether to use the sim policy wrapper"""
 
+    use_torch_compile: bool = True
+    """Apply torch.compile (max-autotune) to the action head DiT forward pass."""
+
+    compile_warmup_iters: int = 7
+    """Warmup inference iterations after torch.compile (benchmark default: warmup 5 + 2). Set 0 to skip."""
+
+
+def _build_random_observation(policy: Gr00tPolicy, seed: int = 0) -> dict:
+    """Synthetic obs matching modality config (same pattern as test_gr00t_policy_gpu)."""
+    rng = np.random.RandomState(seed)
+    mc = policy.modality_configs
+    video_horizon = len(mc["video"].delta_indices)
+    state_horizon = len(mc["state"].delta_indices)
+
+    obs: dict = {"video": {}, "state": {}, "language": {}}
+    for k in mc["video"].modality_keys:
+        obs["video"][k] = rng.randint(
+            0, 255, (1, video_horizon, 256, 256, 3), dtype=np.uint8
+        )
+
+    norm_params = policy.processor.state_action_processor.norm_params[
+        policy.embodiment_tag.value
+    ]["state"]
+    for k in mc["state"].modality_keys:
+        dim = int(norm_params[k]["dim"])
+        obs["state"][k] = rng.randn(1, state_horizon, dim).astype(np.float32)
+
+    language_key = mc["language"].modality_keys[0]
+    obs["language"][language_key] = [["warmup"]]  # content irrelevant for compile
+    return obs
+
+
+def _apply_torch_compile(policy: Gr00tPolicy) -> None:
+    """Match benchmark_inference.py: compile only the DiT action head forward."""
+    policy.model.action_head.model.forward = torch.compile(
+        policy.model.action_head.model.forward, mode="max-autotune"
+    )
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+
+
+def _warmup_torch_compile(policy: Gr00tPolicy, num_iters: int) -> None:
+    """Run E2E inference with random obs to trigger JIT before serving requests."""
+    print(f"  Warming up torch.compile ({num_iters} iterations with random obs)...")
+    obs = _build_random_observation(policy)
+    for _ in range(num_iters):
+        policy.get_action(obs)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    print("  torch.compile warmup complete.")
+
 
 def main(config: ServerConfig):
     config.embodiment_tag = EmbodimentTag.resolve(config.embodiment_tag)
@@ -89,6 +143,11 @@ def main(config: ServerConfig):
             device=config.device,
             strict=config.strict,
         )
+        if config.use_torch_compile and config.device.startswith("cuda"):
+            print("  Applying torch.compile (mode='max-autotune') to action head...")
+            _apply_torch_compile(policy)
+            if config.compile_warmup_iters > 0:
+                _warmup_torch_compile(policy, config.compile_warmup_iters)
     elif config.dataset_path is not None:
         if config.execution_horizon is None:
             raise ValueError(
