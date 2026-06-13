@@ -228,15 +228,42 @@ class Gr00tN1d7ActionHead(nn.Module):
         # Embed noised action trajectory.
         actions = action_input.action
         noise = torch.randn(actions.shape, device=actions.device, dtype=actions.dtype)
-        t = self.sample_time(actions.shape[0], device=actions.device, dtype=actions.dtype)
-        t = t[:, None, None]  # shape (B,1,1) for broadcast
+        B, T, _ = actions.shape
+        time = self.sample_time(B, device=actions.device, dtype=actions.dtype)  # (B,)
 
-        noisy_trajectory = (1 - t) * noise + t * actions
-        velocity = actions - noise
+        # Training-time action conditioning (TT-RTC, arXiv:2512.05964): for each
+        # sample draw an inference delay d ~ Unif[0, rtc_max_delay) and treat the
+        # first d action steps as a clean ground-truth prefix (flow timestep 1.0)
+        # that the model conditions on but does not denoise. The remaining postfix
+        # follows the standard flow-matching objective. ``rtc_max_delay == 0``
+        # falls back to the original objective bit-for-bit.
+        use_ttrtc = self.training and getattr(self.config, "rtc_max_delay", 0) > 0
+        prefix_mask = None
+        if use_ttrtc:
+            max_delay = min(int(self.config.rtc_max_delay), T)
+            delay = torch.randint(0, max_delay, (B,), device=actions.device)
+            prefix_mask = torch.arange(T, device=actions.device)[None, :] < delay[:, None]  # (B, T)
+            # Per-token flow timestep: 1.0 (clean) on the prefix, sampled time on
+            # the postfix.
+            time_per_token = torch.where(prefix_mask, torch.ones_like(time)[:, None], time[:, None])
+            t_tok = time_per_token[:, :, None]  # (B, T, 1)
+            noisy_trajectory = (1 - t_tok) * noise + t_tok * actions  # prefix -> clean actions
+            velocity = actions - noise
+            action_timestep = (time_per_token * self.num_timestep_buckets).long()  # (B, T)
+            # The DiT also conditions the leading state token; give it the sampled
+            # (postfix) time so that at delay==0 the per-token path matches the
+            # original per-sample conditioning exactly.
+            dit_time = torch.cat([time[:, None], time_per_token], dim=1)  # (B, 1 + T)
+            t_discretized = (dit_time * self.num_timestep_buckets).long()  # (B, 1 + T)
+        else:
+            t = time[:, None, None]  # shape (B,1,1) for broadcast
+            noisy_trajectory = (1 - t) * noise + t * actions
+            velocity = actions - noise
+            # Convert (continuous) t -> discrete if needed
+            t_discretized = (time * self.num_timestep_buckets).long()  # (B,)
+            action_timestep = t_discretized
 
-        # Convert (continuous) t -> discrete if needed
-        t_discretized = (t[:, 0, 0] * self.num_timestep_buckets).long()
-        action_features = self.action_encoder(noisy_trajectory, t_discretized, embodiment_id)
+        action_features = self.action_encoder(noisy_trajectory, action_timestep, embodiment_id)
 
         # Maybe add position embedding.
         if self.config.add_pos_embed:
@@ -274,6 +301,11 @@ class Gr00tN1d7ActionHead(nn.Module):
 
         # Slice out only the action portion of pred and target.
         action_mask = action_input.action_mask
+        if use_ttrtc:
+            # Mask the loss to the postfix only: the clean prefix is a condition,
+            # not a prediction target.
+            postfix_mask = (~prefix_mask)[:, :, None].to(action_mask.dtype)  # (B, T, 1)
+            action_mask = action_mask * postfix_mask
         action_loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
         loss = action_loss.sum() / (action_mask.sum() + 1e-6)
 
@@ -346,63 +378,66 @@ class Gr00tN1d7ActionHead(nn.Module):
         # Set initial actions as the sampled noise.
         batch_size = vl_embeds.shape[0]
         device = vl_embeds.device
+        action_horizon = self.config.action_horizon
         actions = torch.randn(
-            size=(batch_size, self.config.action_horizon, self.action_dim),
+            size=(batch_size, action_horizon, self.action_dim),
             dtype=vl_embeds.dtype,
             device=device,
         )
 
         dt = 1.0 / self.num_inference_timesteps
-        vel_strength = torch.ones_like(actions)
 
-        if "action" in action_input:
-            # If action in input when doing get action, it means we want to use RTC.
-            # action_horizon is the action horizon of the input action.
-            # rtc_overlap_steps is the number of steps to overlap with the previous action chunks.
-            # rtc_frozen_steps is the number of steps to freeze the action, which is the latency of the policy inference.
-            # rtc_ramp_rate is the rate of the ramp of denoising the actions.
-            assert options is not None, "options is not None"
-            assert "action_horizon" in options, "action_horizon is not in options"
-            assert "rtc_overlap_steps" in options, "rtc_overlap_steps is not in options"
-            assert "rtc_frozen_steps" in options, "rtc_frozen_steps is not in options"
-            assert "rtc_ramp_rate" in options, "rtc_ramp_rate is not in options"
-
-            action_horizon_before_padding = options["action_horizon"]
-
-            # Use previous action instead of pure noise to do inpainting
-            actions[:, : options["rtc_overlap_steps"], :] = action_input["action"][
-                :,
-                action_horizon_before_padding
-                - options["rtc_overlap_steps"] : action_horizon_before_padding,
-                :,
-            ]
-            vel_strength[:, : options["rtc_frozen_steps"], :] = 0.0
-            # NOTE: use an exponential ramp strength to set the remaining unfrozen rtc_steps
-            intermediate_steps = options["rtc_overlap_steps"] - options["rtc_frozen_steps"]
-            # Create exponential ramp from 0 to 1 over intermediate steps
-            t = torch.linspace(0.0, 1.0, intermediate_steps + 2, device=device)
-            ramp = 1 - torch.exp(-options["rtc_ramp_rate"] * t)
-            ramp = ramp / ramp[-1].clamp_min(1e-8)  # normalize to [0,1]
-            ramp = ramp[
-                1:-1
-            ]  # we will only take the middle part of the ramp, ignore the 0.0 and 1.0
-            # Apply ramp to the intermediate steps [batch, intermediate_steps, action_dim]
-            vel_strength[
-                :,
-                options["rtc_frozen_steps"] : options["rtc_overlap_steps"],
-                :,
-            ] = ramp[None, :, None].to(device)
+        # Training-time action conditioning (TT-RTC) inference, arXiv:2512.05964
+        # Algorithm 1 (sample_actions). When an action prefix is supplied, the
+        # first ``delay`` action steps are pinned to the given clean prefix (flow
+        # timestep 1.0) at every denoising step, and the model only denoises the
+        # postfix. This is the drop-in replacement for the inference-time RTC
+        # interface (action_prefix + delay); no gradient guidance / soft masking
+        # is needed because the prefix conditioning was learned at training time.
+        use_ttrtc = "action" in action_input
+        prefix_mask = None
+        action_prefix = None
+        if use_ttrtc:
+            assert options is not None and "delay" in options, (
+                "TT-RTC inference requires options['delay'] "
+                "(number of valid prefix steps, int or per-sample tensor)."
+            )
+            delay = options["delay"]
+            if isinstance(delay, torch.Tensor):
+                delay = delay.to(device=device).long()
+            else:
+                delay = torch.full((batch_size,), int(delay), device=device, dtype=torch.long)
+            # action_prefix is padded to (B, action_horizon, action_dim); only the
+            # first ``delay`` steps per sample are treated as valid.
+            action_prefix = action_input["action"].to(device=device, dtype=actions.dtype)
+            prefix_mask = (
+                torch.arange(action_horizon, device=device)[None, :] < delay[:, None]
+            )  # (B, H)
 
         # Run denoising steps.
         for t in range(self.num_inference_timesteps):
             t_cont = t / float(self.num_inference_timesteps)  # e.g. goes 0, 1/N, 2/N, ...
-            t_discretized = int(t_cont * self.num_timestep_buckets)
+
+            if use_ttrtc:
+                # Pin the prefix to the clean ground-truth actions before each step.
+                actions = torch.where(prefix_mask[:, :, None], action_prefix, actions)
+                # Per-token flow timestep: 1.0 on the prefix, current time on the postfix.
+                base_time = torch.full((batch_size, action_horizon), float(t_cont), device=device)
+                time_per_token = torch.where(prefix_mask, torch.ones_like(base_time), base_time)
+                action_timestep = (time_per_token * self.num_timestep_buckets).long()  # (B, H)
+                # Prepend the state-token time (postfix time) for the DiT sequence.
+                state_time = torch.full((batch_size, 1), float(t_cont), device=device)
+                dit_time = torch.cat([state_time, time_per_token], dim=1)  # (B, 1 + H)
+                dit_timestep = (dit_time * self.num_timestep_buckets).long()
+            else:
+                t_discretized = int(t_cont * self.num_timestep_buckets)
+                action_timestep = torch.full(
+                    size=(batch_size,), fill_value=t_discretized, device=device
+                )
+                dit_timestep = action_timestep
 
             # Embed noised action trajectory.
-            timesteps_tensor = torch.full(
-                size=(batch_size,), fill_value=t_discretized, device=device
-            )
-            action_features = self.action_encoder(actions, timesteps_tensor, embodiment_id)
+            action_features = self.action_encoder(actions, action_timestep, embodiment_id)
             # Add position embedding.
             if self.config.add_pos_embed:
                 pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
@@ -417,7 +452,7 @@ class Gr00tN1d7ActionHead(nn.Module):
                 model_output = self.model(
                     hidden_states=sa_embs,
                     encoder_hidden_states=vl_embeds,
-                    timestep=timesteps_tensor,
+                    timestep=dit_timestep,
                     image_mask=backbone_output.image_mask,
                     backbone_attention_mask=backbone_output.backbone_attention_mask,
                 )
@@ -425,14 +460,18 @@ class Gr00tN1d7ActionHead(nn.Module):
                 model_output = self.model(
                     hidden_states=sa_embs,
                     encoder_hidden_states=vl_embeds,
-                    timestep=timesteps_tensor,
+                    timestep=dit_timestep,
                 )
             pred = self.action_decoder(model_output, embodiment_id)
 
-            pred_velocity = pred[:, -self.action_horizon :]
+            pred_velocity = pred[:, -action_horizon:]
 
             # Update actions using euler integration.
-            actions = actions + dt * pred_velocity * vel_strength
+            actions = actions + dt * pred_velocity
+
+        if use_ttrtc:
+            # Return the exact clean prefix in the prefix region.
+            actions = torch.where(prefix_mask[:, :, None], action_prefix, actions)
 
         return BatchFeature(
             data={

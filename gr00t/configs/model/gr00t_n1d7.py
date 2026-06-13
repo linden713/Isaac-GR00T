@@ -108,6 +108,14 @@ class Gr00tN1d7Config(PretrainedConfig):
     noise_s: float = 0.999
     num_timestep_buckets: int = 1000
 
+    # Training-time action conditioning (TT-RTC), see arXiv:2512.05964.
+    # During training, a per-sample inference delay d ~ Unif[0, rtc_max_delay) is
+    # sampled. The first d action steps are fed in as clean ground-truth prefix
+    # (flow timestep == 1.0) and excluded from the loss; the model only learns to
+    # denoise the postfix conditioned on that prefix. 0 disables TT-RTC and keeps
+    # the original flow-matching objective bit-for-bit.
+    rtc_max_delay: int = 0
+
     # Training parameters
     tune_projector: bool = True
     tune_diffusion_model: bool = True
